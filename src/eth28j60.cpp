@@ -7,7 +7,7 @@
 
 static const SPISettings SPI_SETTINGS(4000000, MSBFIRST, SPI_MODE0);
 
-#define DEBUG
+//#define DEBUG
 
 void Eth28J60::begin(const uint8_t * mac, uint8_t cs_pin, uint16_t max_frame) {
 	// Initialize class variables
@@ -124,14 +124,9 @@ bool Eth28J60::send(const void * packet, uint16_t len) {
 }
 
 uint16_t Eth28J60::receive(void * packet) {
-	if (regRead(EPKTCNT) == 0) {
-		return 0;
-	}
-
 	uint16_t packet_len = 0;
-	struct rx_header hdr;
 
-	do {
+	while (packet_len == 0 && regRead(EPKTCNT) > 0) {
 		regWrite16(ERDPT, rx_ptr);
 
 		struct rx_header hdr;
@@ -155,39 +150,39 @@ uint16_t Eth28J60::receive(void * packet) {
 			bufferRead(packet, packet_len);
 		}
 
+		/*
+		 * Errata:
+		 * The receive hardware may corrupt the circular
+		 * receive buffer (including the Next Packet Pointer
+		 * and receive status vector fields) when an even value
+		 * is programmed into the ERXRDPTH:ERXRDPTL
+		 * registers. 
+		 *
+		 * Workaround:
+		 * Ensure that only odd addresses are written to the
+		 * ERXRDPT registers. Assuming that ERXND con-
+		 * tains an odd value, many applications can derive a
+		 * suitable value to write to ERXRDPT by subtracting
+		 * one from the Next Packet Pointer (a value always
+		 * ensured to be even because of hardware padding)
+		 * and then compensating for a potential ERXST to
+		 * ERXND wrap-around. Assuming that the receive
+		 * buffer area does not span the 1FFFh to 0000h mem-
+		 * ory boundary, the logic in Example 2 will ensure that
+		 * ERXRDPT is programmed with an odd value
+		 */
+		uint16_t rxRdPt = hdr.next_packet_pointer;
+		if (rxRdPt % 2 == 0) {
+			if (rxRdPt == 0) {
+				rxRdPt = tx_start - 1;
+			} else {
+				rxRdPt--;
+			}
+		}
+		regWrite16(ERXRDPT, rxRdPt);
+
 		regBitSet(ECON2, ECON2_PKTDEC);
 	} while (packet_len == 0 && regRead(EPKTCNT) > 0);
-
-	/*
-	 * Errata:
-	 * The receive hardware may corrupt the circular
-	 * receive buffer (including the Next Packet Pointer
-	 * and receive status vector fields) when an even value
-	 * is programmed into the ERXRDPTH:ERXRDPTL
-	 * registers. 
-	 *
-	 * Workaround:
-	 * Ensure that only odd addresses are written to the
-	 * ERXRDPT registers. Assuming that ERXND con-
-	 * tains an odd value, many applications can derive a
-	 * suitable value to write to ERXRDPT by subtracting
-	 * one from the Next Packet Pointer (a value always
-	 * ensured to be even because of hardware padding)
-	 * and then compensating for a potential ERXST to
-	 * ERXND wrap-around. Assuming that the receive
-	 * buffer area does not span the 1FFFh to 0000h mem-
-	 * ory boundary, the logic in Example 2 will ensure that
-	 * ERXRDPT is programmed with an odd value
-	 */
-	uint16_t rxRdPt = hdr.next_packet_pointer;
-	if (rxRdPt % 2 == 0) {
-		if (rxRdPt == 0) {
-			rxRdPt = tx_start - 1;
-		} else {
-			rxRdPt--;
-		}
-	}
-	regWrite16(ERXRDPT, rxRdPt);
 
 	return packet_len;
 }
