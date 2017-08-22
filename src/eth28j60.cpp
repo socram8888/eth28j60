@@ -7,6 +7,8 @@
 
 static const SPISettings SPI_SETTINGS(4000000, MSBFIRST, SPI_MODE0);
 
+#define DEBUG
+
 void Eth28J60::begin(const uint8_t * mac, uint8_t cs_pin, uint16_t max_frame) {
 	// Initialize class variables
 	this->cs_pin = cs_pin;
@@ -66,10 +68,13 @@ void Eth28J60::begin(const uint8_t * mac, uint8_t cs_pin, uint16_t max_frame) {
 	 */
 
 	// Setup Rx buffer
-	rx_ptr = 0;
-	regWrite16(ERXST, 0);
+	rx_ptr = 0x0000;
+	regWrite16(ERXST, 0x0000);
 	regWrite16(ERXND, tx_start - 1);
-	regWrite16(ERXRDPT, rx_ptr);
+	regWrite16(ERXRDPT, 0x0000);
+
+	// Setup TX pointer
+	regWrite16(ETXST, tx_start);
 
 	// Setup MAC
 	regWrite(MACON1, MACON1_TXPAUS | MACON1_RXPAUS | MACON1_MARXEN); // Enable flow control, Enable MAC Rx
@@ -98,13 +103,13 @@ bool Eth28J60::send(const void * packet, uint16_t len) {
 	// Wait until last packet is sent
 	while (regRead(ECON1) & ECON1_TXRTS);
 
-	// Set pointers (write pointer, start pointer, end pointer)
-	regWrite16(EWRPT, tx_start);
-	regWrite16(ETXST, tx_start);
-	regWrite16(ETXND, tx_start + len);
-
+	// Build control header
 	struct tx_header hdr;
 	hdr.control = 0x00;
+
+	// Set pointers (write pointer, start pointer, end pointer)
+	regWrite16(EWRPT, tx_start);
+	regWrite16(ETXND, tx_start + sizeof(hdr) + len - 1);
 
 	// Write per-packet control byte
 	bufferWrite(&hdr, sizeof(hdr));
@@ -123,20 +128,68 @@ uint16_t Eth28J60::receive(void * packet) {
 		return 0;
 	}
 
-	regWrite16(ERDPT, rx_ptr);
-
+	uint16_t packet_len = 0;
 	struct rx_header hdr;
-	bufferRead(&hdr, sizeof(hdr));
 
-	rx_ptr = hdr.next_packet_pointer;
-	Serial.print("Packet count: ");
-	Serial.println(regRead(EPKTCNT));
-	Serial.print("NPP: 0x");
-	Serial.println(hdr.next_packet_pointer, HEX);
-	Serial.print("Packet length: ");
-	Serial.println(hdr.packet_length);
-	Serial.print("Status: 0x");
-	Serial.println(hdr.status, HEX);
+	do {
+		regWrite16(ERDPT, rx_ptr);
+
+		struct rx_header hdr;
+		bufferRead(&hdr, sizeof(hdr));
+
+		rx_ptr = hdr.next_packet_pointer;
+
+#ifdef DEBUG
+		Serial.print("Packet count: ");
+		Serial.println(regRead(EPKTCNT));
+		Serial.print("NPP: 0x");
+		Serial.println(hdr.next_packet_pointer, HEX);
+		Serial.print("Packet length: ");
+		Serial.println(hdr.packet_length);
+		Serial.print("Status: 0x");
+		Serial.println(hdr.status, HEX);
+#endif
+
+		if ((hdr.status & RX_HEADER_STATUS_OK) && hdr.packet_length - CRC_SIZE <= max_frame) {
+			packet_len = hdr.packet_length - CRC_SIZE;
+			bufferRead(packet, packet_len);
+		}
+
+		regBitSet(ECON2, ECON2_PKTDEC);
+	} while (packet_len == 0 && regRead(EPKTCNT) > 0);
+
+	/*
+	 * Errata:
+	 * The receive hardware may corrupt the circular
+	 * receive buffer (including the Next Packet Pointer
+	 * and receive status vector fields) when an even value
+	 * is programmed into the ERXRDPTH:ERXRDPTL
+	 * registers. 
+	 *
+	 * Workaround:
+	 * Ensure that only odd addresses are written to the
+	 * ERXRDPT registers. Assuming that ERXND con-
+	 * tains an odd value, many applications can derive a
+	 * suitable value to write to ERXRDPT by subtracting
+	 * one from the Next Packet Pointer (a value always
+	 * ensured to be even because of hardware padding)
+	 * and then compensating for a potential ERXST to
+	 * ERXND wrap-around. Assuming that the receive
+	 * buffer area does not span the 1FFFh to 0000h mem-
+	 * ory boundary, the logic in Example 2 will ensure that
+	 * ERXRDPT is programmed with an odd value
+	 */
+	uint16_t rxRdPt = hdr.next_packet_pointer;
+	if (rxRdPt % 2 == 0) {
+		if (rxRdPt == 0) {
+			rxRdPt = tx_start - 1;
+		} else {
+			rxRdPt--;
+		}
+	}
+	regWrite16(ERXRDPT, rxRdPt);
+
+	return packet_len;
 }
 
 void Eth28J60::setMacAddr(const uint8_t * mac) {
@@ -209,9 +262,6 @@ void Eth28J60::bufferRead(void * data, uint16_t len) {
 	SPI.transfer(CMDRBM);
 	while (len) {
 		*bytes = SPI.transfer(0x00);
-		Serial.print(len, HEX);
-		Serial.print(' ');
-		Serial.println(*bytes, HEX);
 		bytes++;
 		len--;
 	}

@@ -12,6 +12,8 @@ struct rx_header {
 	uint16_t status;
 };
 
+#define RX_HEADER_STATUS_OK 0x0080
+
 struct tx_header {
 	uint8_t control;
 };
