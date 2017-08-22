@@ -5,43 +5,19 @@
 #include "eth28j60.h"
 #include "eth28j60_regs.h"
 
-#define BUFFER_LEN 8192
-
-// Maybe this should be configurable?
-#define MAXFRAME 1536
-
-/*
- * Errata:
- * The receive hardware maintains an internal Write
- * Pointer which defines the area in the receive buffer
- * where bytes arriving over the Ethernet are written.
- * This internal Write Pointer should be updated with
- * the value stored in ERXST whenever the Receive
- * Buffer Start Pointer, ERXST, or the Receive Buffer
- * End Pointer, ERXND, is written to by the host
- * microcontroller. Sometimes, when ERXST or
- * ERXND is written to, the exact value, 0000h, is
- * stored in the internal receive Write Pointer instead
- * of the ERXST address
- *
- * Workaround:
- * Use the lower segment of the buffer memory for
- * the receive buffer, starting at address 0000h. For
- * example, use the range (0000h to n) for the
- * receive buffer and ((n + 1) to 8191) for the transmit
- * buffer.
- */
-#define RXSTART 0
-#define RXEND TXSTART
-#define TXSTART (BUFFER_LEN - MAXFRAME)
-
 static const SPISettings SPI_SETTINGS(4000000, MSBFIRST, SPI_MODE0);
 
-void Eth28J60::begin(const uint8_t * mac, uint8_t cs_pin) {
+void Eth28J60::begin(const uint8_t * mac, uint8_t cs_pin, uint16_t max_frame) {
 	// Initialize class variables
 	this->cs_pin = cs_pin;
 	this->cur_bank = 0xFF;
-	this->rx_ptr = 0;
+	this->max_frame = max_frame;
+
+	// Calculate TX offset in buffer
+	tx_start = BUFFER_LEN - max_frame - sizeof(struct tx_header) - sizeof(struct tx_status);
+
+	// Make tx_start even to workaround an errata in receiving
+	tx_start &= 0xFFFE;
 
 	// Initialize SPI if not ready
 	SPI.begin();
@@ -67,21 +43,38 @@ void Eth28J60::begin(const uint8_t * mac, uint8_t cs_pin) {
 	 */
 	delay(1);
 
-	// Setup Rx buffer
-	regWrite16(ERXST, RXSTART);
-	regWrite16(ERXND, RXEND);
-	regWrite16(ERXRDPT, RXSTART);
-	this->rx_ptr = RXSTART;
+	/*
+	 * Errata:
+	 * The receive hardware maintains an internal Write
+	 * Pointer which defines the area in the receive buffer
+	 * where bytes arriving over the Ethernet are written.
+	 * This internal Write Pointer should be updated with
+	 * the value stored in ERXST whenever the Receive
+	 * Buffer Start Pointer, ERXST, or the Receive Buffer
+	 * End Pointer, ERXND, is written to by the host
+	 * microcontroller. Sometimes, when ERXST or
+	 * ERXND is written to, the exact value, 0000h, is
+	 * stored in the internal receive Write Pointer instead
+	 * of the ERXST address
+	 *
+	 * Workaround:
+	 * Use the lower segment of the buffer memory for
+	 * the receive buffer, starting at address 0000h. For
+	 * example, use the range (0000h to n) for the
+	 * receive buffer and ((n + 1) to 8191) for the transmit
+	 * buffer.
+	 */
 
-	// Setup Tx buffer
-	regWrite16(ETXST, TXSTART);
-	regWrite16(ETXND, TXSTART);
-	regWrite16(EWRPT, TXSTART);
+	// Setup Rx buffer
+	rx_ptr = 0;
+	regWrite16(ERXST, 0);
+	regWrite16(ERXND, tx_start - 1);
+	regWrite16(ERXRDPT, rx_ptr);
 
 	// Setup MAC
 	regWrite(MACON1, MACON1_TXPAUS | MACON1_RXPAUS | MACON1_MARXEN); // Enable flow control, Enable MAC Rx
 	regWrite(MACON3, MACON3_PADCFG0 | MACON3_TXCRCEN | MACON3_FRMLNEN | MACON3_FULDPX); // Enable padding, enable CRC & frame len check
-	regWrite16(MAMXFL, MAXFRAME);
+	regWrite16(MAMXFL, max_frame + CRC_SIZE);
 	regWrite(MABBIPG, 0x15); // Set inter-frame gap
 	regWrite(MAIPGL, 0x12);
 	regWrite(MAIPGH, 0x00);
@@ -98,26 +91,23 @@ void Eth28J60::begin(const uint8_t * mac, uint8_t cs_pin) {
 }
 
 bool Eth28J60::send(const void * packet, uint16_t len) {
-	if (len > MAXFRAME) {
+	if (len > max_frame) {
 		return false;
 	}
 
 	// Wait until last packet is sent
-	while (regRead(ECON1) & ECON1_TXRTS) {
-		// TXRTS may not clear - Eth28J60 bug. We must reset transmit logic in case of Tx error
-		if (regRead(EIR) & EIR_TXERIF) {
-			regBitSet(ECON1, ECON1_TXRST);
-			regBitClear(ECON1, ECON1_TXRST);
-		}
-	}
+	while (regRead(ECON1) & ECON1_TXRTS);
 
 	// Set pointers (write pointer, start pointer, end pointer)
-	regWrite16(EWRPT, TXSTART);
-	regWrite16(ETXST, TXSTART);
-	regWrite16(ETXND, TXSTART + len);
+	regWrite16(EWRPT, tx_start);
+	regWrite16(ETXST, tx_start);
+	regWrite16(ETXND, tx_start + len);
+
+	struct tx_header hdr;
+	hdr.control = 0x00;
 
 	// Write per-packet control byte
-	opWrite(CMDWBM, 0, 0x00);
+	bufferWrite(&hdr, sizeof(hdr));
 
 	// Write packet
 	bufferWrite(packet, len);
@@ -128,12 +118,25 @@ bool Eth28J60::send(const void * packet, uint16_t len) {
 	return true;
 }
 
-size_t Eth28J60::receive(void * packet, size_t max_len) {
+uint16_t Eth28J60::receive(void * packet) {
 	if (regRead(EPKTCNT) == 0) {
 		return 0;
 	}
 
-	
+	regWrite16(ERDPT, rx_ptr);
+
+	struct rx_header hdr;
+	bufferRead(&hdr, sizeof(hdr));
+
+	rx_ptr = hdr.next_packet_pointer;
+	Serial.print("Packet count: ");
+	Serial.println(regRead(EPKTCNT));
+	Serial.print("NPP: 0x");
+	Serial.println(hdr.next_packet_pointer, HEX);
+	Serial.print("Packet length: ");
+	Serial.println(hdr.packet_length);
+	Serial.print("Status: 0x");
+	Serial.println(hdr.status, HEX);
 }
 
 void Eth28J60::setMacAddr(const uint8_t * mac) {
@@ -148,6 +151,11 @@ void Eth28J60::setMacAddr(const uint8_t * mac) {
 uint8_t Eth28J60::regRead(uint8_t reg) {
 	bankSet(reg);
 	return opRead(CMDRCR, reg);
+}
+
+uint16_t Eth28J60::regRead16(uint8_t reg) {
+	bankSet(reg);
+	return opRead(CMDRCR, reg + 1) << 8 | opRead(CMDRCR, reg);
 }
 
 void Eth28J60::regWrite(uint8_t reg, uint8_t val) {
@@ -178,13 +186,33 @@ void Eth28J60::phyWrite(uint8_t reg, uint16_t val) {
 	while (regRead(MISTAT) & MISTAT_BUSY); // TODO: timeout
 }
 
-void ENC28J60::bufferWrite(const uint8_t * packet, uint16_t len) {
+void Eth28J60::bufferWrite(const void * data, uint16_t len) {
+	const uint8_t * bytes = (const uint8_t *) data;
+
 	beginTransaction();
 
 	SPI.transfer(CMDWBM);
 	while (len) {
-		SPI.transfer(*packet);
-		packet++;
+		SPI.transfer(*bytes);
+		bytes++;
+		len--;
+	}
+
+	endTransaction();
+}
+
+void Eth28J60::bufferRead(void * data, uint16_t len) {
+	uint8_t * bytes = (uint8_t *) data;
+
+	beginTransaction();
+
+	SPI.transfer(CMDRBM);
+	while (len) {
+		*bytes = SPI.transfer(0x00);
+		Serial.print(len, HEX);
+		Serial.print(' ');
+		Serial.println(*bytes, HEX);
+		bytes++;
 		len--;
 	}
 

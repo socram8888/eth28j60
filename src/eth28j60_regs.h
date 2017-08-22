@@ -1,6 +1,28 @@
 
 #pragma once
 
+#include <stdint.h>
+
+#define BUFFER_LEN 8192
+#define CRC_SIZE 4
+
+struct rx_header {
+	uint16_t next_packet_pointer;
+	uint16_t packet_length;
+	uint16_t status;
+};
+
+struct tx_header {
+	uint8_t control;
+};
+
+struct tx_status {
+	uint16_t transmit_bytes;
+	uint16_t status;
+	uint16_t wire_bytes;
+	uint8_t status2;
+};
+
 #define CMDRCR	0x00	/*!< Read Control Register */
 #define CMDRBM	0x3A	/*!< Read Buffer Memory */
 #define CMDWCR	0x40	/*!< Write Control Register */
