@@ -6,18 +6,40 @@
 #include "eth28j60_regs.h"
 
 #define BUFFER_LEN 8192
-#define MAXFRAME 1536
 
 // Maybe this should be configurable?
-#define TXSTART (BUFFER_LEN - MAXFRAME)
+#define MAXFRAME 1536
+
+/*
+ * Errata:
+ * The receive hardware maintains an internal Write
+ * Pointer which defines the area in the receive buffer
+ * where bytes arriving over the Ethernet are written.
+ * This internal Write Pointer should be updated with
+ * the value stored in ERXST whenever the Receive
+ * Buffer Start Pointer, ERXST, or the Receive Buffer
+ * End Pointer, ERXND, is written to by the host
+ * microcontroller. Sometimes, when ERXST or
+ * ERXND is written to, the exact value, 0000h, is
+ * stored in the internal receive Write Pointer instead
+ * of the ERXST address
+ *
+ * Workaround:
+ * Use the lower segment of the buffer memory for
+ * the receive buffer, starting at address 0000h. For
+ * example, use the range (0000h to n) for the
+ * receive buffer and ((n + 1) to 8191) for the transmit
+ * buffer.
+ */
 #define RXSTART 0
 #define RXEND TXSTART
+#define TXSTART (BUFFER_LEN - MAXFRAME)
 
 static const SPISettings SPI_SETTINGS(4000000, MSBFIRST, SPI_MODE0);
 
-bool ENC28J60::begin(const uint8_t * mac, uint8_t cs_pin) {
+void Eth28J60::begin(const uint8_t * mac, uint8_t cs_pin) {
 	// Initialize class variables
-	this->cs_pin = 10;
+	this->cs_pin = cs_pin;
 	this->cur_bank = 0xFF;
 	this->rx_ptr = 0;
 
@@ -27,14 +49,23 @@ bool ENC28J60::begin(const uint8_t * mac, uint8_t cs_pin) {
 	// Set CS pin as output
 	pinMode(cs_pin, OUTPUT);
 
-	// Wait for oscillator stabilization
-	// TODO: timeout
-	while ((regRead(ESTAT) & ESTAT_CLKRDY) == 0);
-
 	// Issue soft reset
 	beginTransaction();
 	SPI.transfer(CMDSR);
 	endTransaction();
+
+	/*
+	 * Errata:
+	 * After sending an SPI Reset command, the PHY
+	 * clock is stopped but the ESTAT.CLKRDY bit is not
+	 * cleared. Therefore, polling the CLKRDY bit will not
+	 * work to detect if the PHY is read.
+	 *
+	 * Workaround:
+	 * After issuing the Reset command, wait at least
+	 * 1 ms in firmware for the device to be read
+	 */
+	delay(1);
 
 	// Setup Rx buffer
 	regWrite16(ERXST, RXSTART);
@@ -49,8 +80,7 @@ bool ENC28J60::begin(const uint8_t * mac, uint8_t cs_pin) {
 
 	// Setup MAC
 	regWrite(MACON1, MACON1_TXPAUS | MACON1_RXPAUS | MACON1_MARXEN); // Enable flow control, Enable MAC Rx
-	regWrite(MACON2, 0); // Clear reset
-	regWrite(MACON3, MACON3_PADCFG0 | MACON3_TXCRCEN | MACON3_FRMLNEN | MACON3_FULDPX); //  Enable padding, enable CRC & frame len check
+	regWrite(MACON3, MACON3_PADCFG0 | MACON3_TXCRCEN | MACON3_FRMLNEN | MACON3_FULDPX); // Enable padding, enable CRC & frame len check
 	regWrite16(MAMXFL, MAXFRAME);
 	regWrite(MABBIPG, 0x15); // Set inter-frame gap
 	regWrite(MAIPGL, 0x12);
@@ -59,36 +89,29 @@ bool ENC28J60::begin(const uint8_t * mac, uint8_t cs_pin) {
 
 	// Setup PHY
 	phyWrite(PHCON1, PHCON1_PDPXMD); // Force full-duplex mode
-	phyWrite(PHCON2, PHCON2_HDLDIS); // Disable loopback
 	phyWrite(PHLCON, PHLCON_LEDA_LINK_STATUS | PHLCON_LEDB_TXRX_ACTIVITY | PHLCON_LFRQ0 | PHLCON_STRCH);
 
 	// Enable Rx packets
 	regBitSet(ECON1, ECON1_RXEN);
 
-	// Reset transmit buffer
-	regBitSet(ECON1, ECON1_TXRST);
-	regBitClear(ECON1, ECON1_TXRST);
-
 	return true;
 }
 
-uint16_t ENC28J60::receive(uint8_t * packet, uint16_t maxLen, uint16_t timeout) {
-	return 0;
-}
-
-bool ENC28J60::transmit(const uint8_t * packet, uint16_t len) {
-	if (len >= MAXFRAME) {
+bool Eth28J60::send(const void * packet, uint16_t len) {
+	if (len > MAXFRAME) {
 		return false;
 	}
 
+	// Wait until last packet is sent
 	while (regRead(ECON1) & ECON1_TXRTS) {
-		// TXRTS may not clear - ENC28J60 bug. We must reset transmit logic in case of Tx error
+		// TXRTS may not clear - Eth28J60 bug. We must reset transmit logic in case of Tx error
 		if (regRead(EIR) & EIR_TXERIF) {
 			regBitSet(ECON1, ECON1_TXRST);
 			regBitClear(ECON1, ECON1_TXRST);
 		}
 	}
 
+	// Set pointers (write pointer, start pointer, end pointer)
 	regWrite16(EWRPT, TXSTART);
 	regWrite16(ETXST, TXSTART);
 	regWrite16(ETXND, TXSTART + len);
@@ -105,7 +128,15 @@ bool ENC28J60::transmit(const uint8_t * packet, uint16_t len) {
 	return true;
 }
 
-void ENC28J60::setMacAddr(const uint8_t * mac) {
+size_t Eth28J60::receive(void * packet, size_t max_len) {
+	if (regRead(EPKTCNT) == 0) {
+		return 0;
+	}
+
+	
+}
+
+void Eth28J60::setMacAddr(const uint8_t * mac) {
 	regWrite(MAADR5, mac[0]);
 	regWrite(MAADR4, mac[1]);
 	regWrite(MAADR3, mac[2]);
@@ -114,33 +145,33 @@ void ENC28J60::setMacAddr(const uint8_t * mac) {
 	regWrite(MAADR0, mac[5]);
 }
 
-uint8_t ENC28J60::regRead(uint8_t reg) {
+uint8_t Eth28J60::regRead(uint8_t reg) {
 	bankSet(reg);
 	return opRead(CMDRCR, reg);
 }
 
-void ENC28J60::regWrite(uint8_t reg, uint8_t val) {
+void Eth28J60::regWrite(uint8_t reg, uint8_t val) {
 	bankSet(reg);
 	opWrite(CMDWCR, reg, val);
 }
 
-void ENC28J60::regWrite16(uint8_t reg, uint16_t val) {
+void Eth28J60::regWrite16(uint8_t reg, uint16_t val) {
 	bankSet(reg);
 	opWrite(CMDWCR, reg, val);
 	opWrite(CMDWCR, reg + 1, val >> 8);
 }
 
-void ENC28J60::regBitSet(uint8_t reg, uint8_t mask) {
+void Eth28J60::regBitSet(uint8_t reg, uint8_t mask) {
 	bankSet(reg);
 	opWrite(CMDBFS, reg, mask);
 }
 
-void ENC28J60::regBitClear(uint8_t reg, uint8_t mask) {
+void Eth28J60::regBitClear(uint8_t reg, uint8_t mask) {
 	bankSet(reg);
 	opWrite(CMDBFC, reg, mask);
 }
 
-void ENC28J60::phyWrite(uint8_t reg, uint16_t val) {
+void Eth28J60::phyWrite(uint8_t reg, uint16_t val) {
 	regWrite(MIREGADR, reg);
 	regWrite16(MIWR, val);
 	delayMicroseconds(11); // 10.24us
@@ -160,7 +191,7 @@ void ENC28J60::bufferWrite(const uint8_t * packet, uint16_t len) {
 	endTransaction();
 }
 
-void ENC28J60::bankSet(uint8_t reg) {
+void Eth28J60::bankSet(uint8_t reg) {
 	uint8_t addr = reg & ADDR_MASK;
 
 	// These are available in all banks
@@ -178,7 +209,7 @@ void ENC28J60::bankSet(uint8_t reg) {
 	cur_bank = bank;
 }
 
-void ENC28J60::opWrite(uint8_t cmd, uint8_t addr, uint8_t val) {
+void Eth28J60::opWrite(uint8_t cmd, uint8_t addr, uint8_t val) {
 	uint8_t buf[2];
 	buf[0] = cmd | (addr & ADDR_MASK);
 	buf[1] = val;
@@ -188,7 +219,7 @@ void ENC28J60::opWrite(uint8_t cmd, uint8_t addr, uint8_t val) {
 	endTransaction();
 }
 
-uint8_t ENC28J60::opRead(uint8_t cmd, uint8_t addr) {
+uint8_t Eth28J60::opRead(uint8_t cmd, uint8_t addr) {
 	uint8_t buf[3];
 
 	uint8_t len = 2;
@@ -208,14 +239,14 @@ uint8_t ENC28J60::opRead(uint8_t cmd, uint8_t addr) {
 	return buf[len - 1];
 }
 
-void ENC28J60::beginTransaction() {
+void Eth28J60::beginTransaction() {
 	SPI.beginTransaction(SPI_SETTINGS);
 
 	// Enable device now
 	digitalWrite(this->cs_pin, LOW);
 }
 
-void ENC28J60::endTransaction() {
+void Eth28J60::endTransaction() {
 	// Disable SPI device
 	digitalWrite(this->cs_pin, HIGH);
 

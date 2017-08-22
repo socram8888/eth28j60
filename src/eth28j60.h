@@ -1,31 +1,18 @@
 
 #pragma once
 
-#include "dataio.h"
-
-class PacketWriter : class DataWriter {
+class Eth28J60 {
 	public:
-		uint16_t write(const uint8_t * data, uint16_t len);
-		bool send();
-		void close();
-};
-
-class PacketReader : class DataReader {
-	public:
-		uint16_t read(uint8_t * data, uint16_t len);
-};
-
-class ENC28J60 {
-	public:
-		bool begin(const uint8_t * mac, uint8_t cs_pin = 10);
-		uint16_t receive(uint8_t * packet, uint16_t maxLen, uint16_t timeout = 0);
-		PacketWriter transmit(const uint8_t * packet, size_t len);
+		void begin(const uint8_t * mac, uint8_t cs_pin = 10);
+		size_t receive(void * packet, size_t max_len);
+		bool send(const void * packet, size_t len);
 		void setMacAddr(const uint8_t * mac);
 
 	private:
 		uint8_t cs_pin;
 		uint8_t cur_bank;
 		uint16_t rx_ptr;
+		uint16_t tx_len;
 
 		uint8_t regRead(uint8_t reg);
 		void regWrite(uint8_t reg, uint8_t val);
